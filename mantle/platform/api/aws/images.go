@@ -362,6 +362,85 @@ func (a *API) CreateImportRole(bucket string) error {
 	return nil
 }
 
+func (a *API) CreateWinLiImage(snapshotID string, name string, description string, architecture string, windowsAMI string, instanceType string, volumetype string) (string, string, error) {
+	//var awsArch string
+	if architecture != "x86_64" {
+		return "", "", fmt.Errorf("unsupported WinLi architecture %q", architecture)
+	}
+
+	// TO-DO:
+	//   - setup for windows instance
+	//       - getSecurityGroupID
+	opts := *a.opts
+	opts.AMI = windowsAMI
+	opts.InstanceType = instanceType
+	opts.SecurityGroup = "winli-builder"
+	aa, _ := New(&opts)
+
+	//   - spool up windows instance
+	//   - wait for startup
+	instanceName := "winli-builder"
+	keyname := ""
+	ud := ""
+	count := 1
+	minDiskSize := 0
+	useInstanceProfile := false
+
+	insts, err := aa.CreateInstances(instanceName, keyname, ud, uint64(count), int64(minDiskSize), useInstanceProfile)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create windows server instance %q", err)
+	}
+
+	winliInstanceId := *insts[0].InstanceId
+
+	//   - stop instance
+	plog.Infof("Created winli-builder: %v", winliInstanceId) //debugging, will remove
+	err = aa.StopInstances([]string{winliInstanceId})
+	if err != nil {
+		return "", "", fmt.Errorf("stop instances failed: %v", err)
+	}
+
+	//   - make a volume from the RHCOS source snapshot
+	//   - wait for volume to create
+	azn := *insts[0].Placement.AvailabilityZone
+	newRootVolumeID, err := aa.CreateVolumeFromSnapshot(snapshotID, volumetype, azn)
+	if err != nil {
+		return "", "", fmt.Errorf("error creating volume from snapshot: %v", err)
+	}
+
+	plog.Infof("created new root volume from snapshot: %v", newRootVolumeID) //debugging, will remove
+
+
+	rootVolumeDevName := "/dev/sda1"
+	err = aa.ReplaceRootVolume(winliInstanceId, rootVolumeDevName, newRootVolumeID)
+	if err != nil {
+		return "", "", fmt.Errorf("error replacing root volume: %v", err)
+	}
+
+	plog.Infof("successfully replaced root volume") //debugging, will remove
+
+	// if we made it here, we have a windows instance with an CoreOS root volume.
+	// create an image based on the modified instance and return the ImageId
+	params := &ec2.CreateImageInput{
+		Name:               aws.String(name),
+		Description:		aws.String(description),
+		InstanceId:			aws.String(winliInstanceId),
+	}
+
+	//   - create AMI from the modified windows instance
+	imageID, snapshotID, err := aa.CreateImageFromInstance(params)
+
+	//   - delete the windows instance
+	terminateErr := aa.TerminateInstances([]string{winliInstanceId})
+	if terminateErr != nil {
+		// log the failure and continue
+		plog.Infof("failed to terminate instance %v: %v", winliInstanceId, terminateErr)
+	}
+
+	return imageID, snapshotID, err
+
+}
+
 func (a *API) CreateHVMImage(snapshotID string, diskSizeGiB uint, name string, description string, architecture string, volumetype string, imdsv2Only bool, X86BootMode string) (string, error) {
 	var awsArch string
 	var bootmode string
