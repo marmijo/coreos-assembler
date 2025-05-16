@@ -18,8 +18,10 @@ package azure
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
 
 	"github.com/coreos/coreos-assembler/mantle/util"
@@ -84,8 +86,36 @@ func (a *API) createPublicIP(resourceGroup string) (armnetwork.PublicIPAddress, 
 	name := util.RandomName("ip")
 	ctx := context.Background()
 
+	var ipSKU *armnetwork.PublicIPAddressSKU
+	var ipProperties *armnetwork.PublicIPAddressPropertiesFormat
+	var ipZones []*string
+
+	// set SKU=Standard, Zllocation Method=Static and Availability Zone on public IPs when creating gen 2 images
+	if strings.EqualFold(a.opts.HyperVGeneration, string(armcompute.HyperVGenerationV2)) {
+		ipSKU = &armnetwork.PublicIPAddressSKU{
+			Name: to.Ptr(armnetwork.PublicIPAddressSKUNameStandard),
+		}
+		ipProperties = &armnetwork.PublicIPAddressPropertiesFormat{
+			PublicIPAllocationMethod: to.Ptr(armnetwork.IPAllocationMethodStatic),
+		}
+		ipZones = []*string{to.Ptr(a.opts.AvailabilityZone)}
+	// gen 1
+	} else {
+		ipSKU = &armnetwork.PublicIPAddressSKU{
+		Name: to.Ptr(armnetwork.PublicIPAddressSKUNameBasic),
+		}
+		ipProperties = &armnetwork.PublicIPAddressPropertiesFormat{
+			PublicIPAllocationMethod: to.Ptr(armnetwork.IPAllocationMethodDynamic),
+		}
+		// No Zones for Gen1
+		ipZones = nil
+	}
+
 	poller, err := a.ipClient.BeginCreateOrUpdate(ctx, resourceGroup, name, armnetwork.PublicIPAddress{
 		Location: to.Ptr(a.opts.Location),
+		Zones: ipZones,
+		SKU: ipSKU,
+		Properties: ipProperties,
 	}, nil)
 	if err != nil {
 		return armnetwork.PublicIPAddress{}, err
