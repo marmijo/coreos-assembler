@@ -275,7 +275,7 @@ OnFailureJobMode=isolate
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=bash -c "[[ $(lsblk -no LABEL /dev/sr0) == %s-* ]]"
+ExecStart=bash -c 'lsblk -lap'
 [Install]
 RequiredBy=coreos-installer.target`
 
