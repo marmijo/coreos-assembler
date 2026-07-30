@@ -17,12 +17,14 @@ package gcloud
 
 import (
 	"context"
+	"fmt"
 	"google.golang.org/api/option"
 	"net/http"
 	"time"
 
 	"github.com/coreos/pkg/capnslog"
 	"google.golang.org/api/compute/v1"
+	"google.golang.org/api/storage/v1"
 
 	"github.com/coreos/coreos-assembler/mantle/auth"
 	"github.com/coreos/coreos-assembler/mantle/platform"
@@ -42,6 +44,7 @@ type Options struct {
 	ServiceAcct      string
 	JSONKeyFile      string
 	ServiceAuth      bool
+	UniverseDomain   string
 	ConfidentialType string
 	*platform.Options
 }
@@ -66,6 +69,10 @@ func New(opts *Options) (*API, error) {
 		}
 	}
 
+	if opts.UniverseDomain != "" && opts.ServiceAuth {
+		return nil, fmt.Errorf("--service-auth is not supported with --universe-domain")
+	}
+
 	if opts.ServiceAuth {
 		client = auth.GoogleServiceClient()
 	} else {
@@ -77,8 +84,7 @@ func New(opts *Options) (*API, error) {
 	}
 
 	ctx := context.Background()
-
-	computeService, err := compute.NewService(ctx, option.WithHTTPClient(client))
+	computeService, err := newComputeService(ctx, opts, client)
 	if err != nil {
 		return nil, err
 	}
@@ -102,6 +108,33 @@ func New(opts *Options) (*API, error) {
 
 func (a *API) Client() *http.Client {
 	return a.client
+}
+
+func (a *API) NewStorageService(ctx context.Context) (*storage.Service, error) {
+	if a.options.UniverseDomain != "" {
+		return storage.NewService(ctx,
+			option.WithCredentialsFile(a.options.JSONKeyFile),
+			option.WithUniverseDomain(a.options.UniverseDomain),
+		)
+	}
+	return storage.NewService(ctx, option.WithHTTPClient(a.client))
+}
+
+func (a *API) StorageURL(bucket, object string) string {
+	if a.options.UniverseDomain != "" {
+		return fmt.Sprintf("https://storage.%s/%v/%v", a.options.UniverseDomain, bucket, object)
+	}
+	return fmt.Sprintf("https://storage.googleapis.com/%v/%v", bucket, object)
+}
+
+func newComputeService(ctx context.Context, opts *Options, client *http.Client) (*compute.Service, error) {
+	if opts.UniverseDomain != "" {
+		return compute.NewService(ctx,
+			option.WithCredentialsFile(opts.JSONKeyFile),
+			option.WithUniverseDomain(opts.UniverseDomain),
+		)
+	}
+	return compute.NewService(ctx, option.WithHTTPClient(client))
 }
 
 func (a *API) GC(gracePeriod time.Duration) error {

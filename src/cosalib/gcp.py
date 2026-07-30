@@ -62,6 +62,8 @@ def gcp_run_ore(build, args):
         '--json-key', args.json_key,
 
     ]
+    if args.universe_domain:
+        ore_common_args.extend(['--universe-domain', args.universe_domain])
     if args.log_level:
         ore_common_args.extend(['--log-level', args.log_level])
 
@@ -80,7 +82,10 @@ def gcp_run_ore(build, args):
         ore_upload_cmd.extend(['--description', args.description])
     if args.public:
         ore_upload_cmd.extend(['--public'])
-    for license in args.license or DEFAULT_LICENSES:
+    licenses = args.license
+    if licenses is None and not args.universe_domain:
+        licenses = DEFAULT_LICENSES
+    for license in licenses or []:
         ore_upload_cmd.extend(['--license', license])
     runcmd(ore_upload_cmd)
 
@@ -141,6 +146,9 @@ def gcp_cli(parser):
     parser.add_argument("--project",
                         help="GCP Project name",
                         default=os.environ.get("GCP_PROJECT_NAME"))
+    parser.add_argument("--universe-domain",
+                        help="Google Cloud universe domain for Dedicated/Trusted Partner Cloud environments",
+                        default=os.environ.get("GCP_UNIVERSE_DOMAIN"))
     parser.add_argument("--family",
                         help="GCP image family to attach image to",
                         default=None)

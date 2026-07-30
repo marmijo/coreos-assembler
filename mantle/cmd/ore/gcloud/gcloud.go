@@ -47,6 +47,7 @@ func init() {
 	sv(&opts.BaseName, "basename", "kola", "instance name prefix")
 	sv(&opts.Network, "network", "default", "network name")
 	sv(&opts.JSONKeyFile, "json-key", "", "use a service account's JSON key for authentication")
+	sv(&opts.UniverseDomain, "universe-domain", "", "Google Cloud universe domain for Dedicated/Trusted Partner Cloud environments")
 	GCloud.PersistentFlags().BoolVar(&opts.ServiceAuth, "service-auth", false, "use non-interactive auth when running within GCP")
 
 	cli.WrapPreRun(GCloud, preauth)

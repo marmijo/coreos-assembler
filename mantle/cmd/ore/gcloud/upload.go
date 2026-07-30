@@ -23,7 +23,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"google.golang.org/api/googleapi"
-	"google.golang.org/api/option"
 	"google.golang.org/api/storage/v1"
 
 	"github.com/coreos/coreos-assembler/mantle/platform/api/gcloud"
@@ -106,7 +105,7 @@ func runUpload(cmd *cobra.Command, args []string) {
 	imageNameGCP := gcpSanitize(uploadImageName)
 
 	ctx := context.Background()
-	storageAPI, err := storage.NewService(ctx, option.WithHTTPClient(api.Client()))
+	storageAPI, err := api.NewStorageService(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Storage client failed: %v\n", err)
 		os.Exit(1)
@@ -129,19 +128,19 @@ func runUpload(cmd *cobra.Command, args []string) {
 		switch ans {
 		case "y", "Y", "yes":
 			fmt.Println("Overriding existing file...")
-			err = writeFile(storageAPI, uploadBucket, uploadFile, imageNameGS)
+			err = writeFile(storageAPI, uploadBucket, uploadFile, imageNameGS, opts.UniverseDomain == "")
 		default:
 			fmt.Println("Skipped file upload")
 		}
 	} else {
-		err = writeFile(storageAPI, uploadBucket, uploadFile, imageNameGS)
+		err = writeFile(storageAPI, uploadBucket, uploadFile, imageNameGS, opts.UniverseDomain == "")
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Uploading image failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	imageStorageURL := fmt.Sprintf("https://storage.googleapis.com/%v/%v", uploadBucket, imageNameGS)
+	imageStorageURL := api.StorageURL(uploadBucket, imageNameGS)
 
 	if uploadCreateImage {
 		fmt.Printf("Creating image in GCP: %v...\n", imageNameGCP)
@@ -238,7 +237,7 @@ func gcpSanitize(name string) string {
 }
 
 // Write file to Google Storage
-func writeFile(api *storage.Service, bucket, filename, destname string) error {
+func writeFile(api *storage.Service, bucket, filename, destname string, setPredefinedACL bool) error {
 	fmt.Printf("Writing %v to gs://%v/%v ...\n", filename, bucket, destname)
 	fmt.Printf("(Sometimes this takes a few minutes)\n")
 
@@ -252,7 +251,9 @@ func writeFile(api *storage.Service, bucket, filename, destname string) error {
 		Name:        destname,
 		ContentType: "application/x-gzip",
 	})
-	req.PredefinedAcl("authenticatedRead")
+	if setPredefinedACL {
+		req.PredefinedAcl("authenticatedRead")
+	}
 	req.Media(file)
 
 	if _, err := req.Do(); err != nil {
