@@ -409,57 +409,48 @@ func (a *API) GetZonesForInstanceType(instanceType string) ([]string, error) {
 }
 
 // KeepalivePurpose is the value of the Purpose tag on throwaway instances
-// launched to keep an AMI active. It's what tells these apart from kola's
-// instances in the console; gcEC2 collects both, since it matches the
-// CreatedBy=mantle tag these also carry.
+// launched to keep an AMI active, telling them apart from kola's in the
+// console. gcEC2 collects both, matching the CreatedBy=mantle tag these carry.
 const KeepalivePurpose = "ami-keepalive"
 
-// keepaliveRunTimeout bounds a single RunInstances attempt, including the
-// SDK's own retries. RunInstances normally answers in a few seconds; this is
-// here so a hung call can't stall a run that has to get through every at-risk
-// AMI in a region.
+// keepaliveRunTimeout bounds one RunInstances attempt, SDK retries included, so
+// a hung call can't stall a run that has every at-risk AMI in a region to get
+// through. RunInstances normally answers in a few seconds.
 const keepaliveRunTimeout = 30 * time.Second
 
-// ErrInstanceQuotaExceeded reports that a launch failed because the account is
-// out of on-demand instance capacity in this region. Every subsequent launch
-// would fail the same way, so callers should stop rather than work through the
-// rest of their list.
+// ErrInstanceQuotaExceeded reports that the account is out of on-demand
+// capacity in this region. Every subsequent launch would fail the same way, so
+// callers should stop rather than work through the rest of their list.
 var ErrInstanceQuotaExceeded = errors.New("on-demand instance quota exceeded")
 
-// ErrNoDefaultVPC reports that a launch failed because the region has no
-// default VPC to put the instance in. Like a quota failure this is a property
-// of the region rather than of one AMI, so callers should stop rather than work
-// through the rest of their list.
+// ErrNoDefaultVPC reports that the region has no default VPC to launch into.
+// Like a quota failure this is a property of the region, not of one AMI, so
+// callers should stop rather than work through the rest of their list.
 //
-// AWS creates a default VPC in every region when the account enables it, so
-// this should not happen. If it does — most likely in a newly onboarded region,
-// or one where someone deleted the default VPC by hand — recreate it with:
+// AWS creates a default VPC when an account enables a region, so this should
+// not happen. If it does — a newly onboarded region, or one where someone
+// deleted the default VPC by hand — recreate it with:
 //
 //	aws ec2 create-default-vpc --region <region>
 var ErrNoDefaultVPC = errors.New("region has no default VPC")
 
-// keepaliveInstanceTypes lists, per architecture, the instance types to try for
-// a keepalive launch, cheapest first. They're all Nitro so that they can boot
-// UEFI images; aarch64 CoreOS AMIs are always registered with a UEFI boot mode
-// (see CreateHVMImage).
-//
-// The burstable types come first because they're broadly available and cheap.
-// The second entry is from a different family and is tried if the first is not
-// offered or has no capacity.
+// keepaliveInstanceTypes lists, per architecture, the instance types to try,
+// cheapest first. All Nitro, so they can boot UEFI images; aarch64 CoreOS AMIs
+// are always registered with a UEFI boot mode (see CreateHVMImage). The
+// burstable types come first as broadly available and cheap; the second entry
+// is a different family, tried if the first isn't offered or has no capacity.
 var keepaliveInstanceTypes = map[ec2types.ArchitectureValues][]string{
 	ec2types.ArchitectureValuesX8664: {"t3.micro", "m6i.large"},
 	ec2types.ArchitectureValuesArm64: {"t4g.micro", "m6g.medium"},
 }
 
-// LaunchKeepaliveInstance launches a single throwaway instance from the given
-// AMI, purely so that AWS records a launch against it, and returns the instance
-// ID along with the instance type that worked. The caller is responsible for
-// terminating the instance.
+// LaunchKeepaliveInstance launches one throwaway instance from the given AMI,
+// purely so AWS records a launch against it, and returns the instance ID and
+// the instance type that worked. The caller must terminate the instance.
 //
-// Unlike CreateInstances, this attaches no key pair and no user data, and
-// doesn't wait for the instance to become reachable, because nothing ever logs
-// into it. It launches into the region's default VPC, so that it needs no
-// network of its own and leaves nothing behind once the instance is terminated.
+// Unlike CreateInstances it attaches no key pair and no user data, and doesn't
+// wait for reachability, because nothing ever logs in. It uses the region's
+// default VPC, so it needs no network of its own and leaves nothing behind.
 //
 // A failure that would defeat any further launch in this region is returned
 // wrapping ErrInstanceQuotaExceeded or ErrNoDefaultVPC.
@@ -480,15 +471,15 @@ func (a *API) LaunchKeepaliveInstance(imageID string, arch ec2types.Architecture
 		}
 		attempts = append(attempts, fmt.Sprintf("%v: %v", instanceType, err))
 		if isNoDefaultVPCError(err) {
-			// Nothing to do with the instance type, and nothing a later run
-			// fixes by itself: someone has to create the default VPC.
+			// Not the instance type's doing, and no later run fixes it by
+			// itself: someone has to create the default VPC.
 			return "", "", fmt.Errorf("launching keepalive instance from %v: %w; "+
 				"create one with \"aws ec2 create-default-vpc --region %v\": %v",
 				imageID, ErrNoDefaultVPC, a.opts.Region, strings.Join(attempts, "; "))
 		}
 		if isInstanceQuotaError(err) {
-			// A different instance type wouldn't help: the quota counts vCPUs
-			// across the whole family, and the fallback types are no smaller.
+			// Another type wouldn't help: the quota counts vCPUs across the
+			// family, and the fallback types are no smaller.
 			return "", "", fmt.Errorf("launching keepalive instance from %v: %w: %v",
 				imageID, ErrInstanceQuotaExceeded, strings.Join(attempts, "; "))
 		}
@@ -501,8 +492,8 @@ func (a *API) LaunchKeepaliveInstance(imageID string, arch ec2types.Architecture
 }
 
 // runKeepaliveInstance makes one bounded RunInstances call. The client token
-// makes it idempotent, so the SDK's internal retry of a lost response returns
-// the original launch rather than creating a second instance.
+// makes it idempotent, so an SDK retry of a lost response returns the original
+// launch rather than creating a second instance.
 func (a *API) runKeepaliveInstance(imageID, instanceType string) (*ec2.RunInstancesOutput, error) {
 	input := keepaliveRunInstancesInput(imageID, instanceType, uuid.NewString())
 	ctx, cancel := context.WithTimeout(context.Background(), keepaliveRunTimeout)
@@ -530,9 +521,8 @@ func keepaliveRunInstancesInput(imageID, instanceType, clientToken string) ec2.R
 	return input
 }
 
-// isUnusableInstanceTypeError reports whether RunInstances failed in a way that
-// a different instance type might fix: the type isn't offered here, isn't valid
-// for the AMI, or has no capacity right now.
+// isUnusableInstanceTypeError reports whether another instance type might fix
+// the failure: this one isn't offered here, isn't valid for the AMI, or is full.
 func isUnusableInstanceTypeError(err error) bool {
 	var ae smithy.APIError
 	if !errors.As(err, &ae) {
@@ -545,10 +535,9 @@ func isUnusableInstanceTypeError(err error) bool {
 	return false
 }
 
-// isNoDefaultVPCError reports whether RunInstances failed because there's no
-// default VPC to launch into. EC2 answers VPCIdNotSpecified when the request
-// names no subnet and the region has no default VPC; DefaultVpcDoesNotExist is
-// the same condition reported by some other calls.
+// isNoDefaultVPCError reports whether RunInstances failed for want of a default
+// VPC. EC2 answers VPCIdNotSpecified when a request names no subnet and the
+// region has no default; other calls report the same as DefaultVpcDoesNotExist.
 func isNoDefaultVPCError(err error) bool {
 	var ae smithy.APIError
 	if !errors.As(err, &ae) {
@@ -561,11 +550,10 @@ func isNoDefaultVPCError(err error) bool {
 	return false
 }
 
-// isInstanceQuotaError reports whether RunInstances failed because the account
-// is at its on-demand instance limit for the region. Unlike a capacity
-// shortfall this is a property of the account, not of the moment, so retrying
-// or trying another type won't help until instances are released or the quota
-// is raised.
+// isInstanceQuotaError reports whether the account is at its on-demand instance
+// limit for the region. Unlike a capacity shortfall this is a property of the
+// account, not the moment, so retrying or switching type won't help until
+// instances are released or the quota is raised.
 func isInstanceQuotaError(err error) bool {
 	var ae smithy.APIError
 	if !errors.As(err, &ae) {
@@ -578,19 +566,17 @@ func isInstanceQuotaError(err error) bool {
 	return false
 }
 
-// WaitForInstancesRunning waits for every given instance to reach "running",
-// and returns the ones that didn't, keyed by instance ID, with EC2's reason
-// where it gave one. A nil map means they all made it. The returned error is
-// non-nil only when the states couldn't be determined at all, which is a
-// different problem from an instance failing to start and is reported as such.
+// WaitForInstancesRunning waits for every given instance to reach "running" and
+// returns the ones that didn't, keyed by instance ID, with EC2's reason where
+// it gave one. A nil map means they all made it. The error is non-nil only when
+// no state could be read at all, a different problem from a failed start.
 func (a *API) WaitForInstancesRunning(ctx context.Context, ids []string, timeout time.Duration) (map[string]error, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
 	input := &ec2.DescribeInstancesInput{InstanceIds: ids}
 	// The waiter already treats InvalidInstanceID.NotFound as "keep waiting",
-	// which covers an instance ID that isn't visible yet. Poll no faster than
-	// this, or we risk being throttled.
+	// covering an ID that isn't visible yet. Poll no faster, or risk throttling.
 	waiter := ec2.NewInstanceRunningWaiter(a.ec2, func(o *ec2.InstanceRunningWaiterOptions) {
 		o.MinDelay = 10 * time.Second
 	})

@@ -31,18 +31,14 @@ import (
 )
 
 const (
-	// AWS removes the public sharing property from a deprecated AMI once it
-	// hasn't been used to launch an instance for six months.
+	// AWS unshares a deprecated AMI once it hasn't been launched for six months.
 	keepaliveCutoff = 183 * 24 * time.Hour
-	// How far ahead of either deadline to act, so that a missed run or two
-	// doesn't cost us an AMI. Applied to the last-launch clock and to the
-	// deprecation date alike: an AMI that is already six months idle when it
-	// deprecates is eligible for unsharing the moment the date passes, so
-	// waiting for it to pass concedes a window.
+	// How far ahead of either deadline to act, so a missed run or two doesn't
+	// cost us an AMI. Applied to the deprecation date too: an AMI already six
+	// months idle when it deprecates can be unshared the moment the date passes.
 	keepaliveBuffer = 14 * 24 * time.Hour
 
-	// How long to wait for a keepalive instance to reach "running". Instances
-	// normally get there in well under a minute; this is just a bound.
+	// Bound on the wait for "running"; instances get there in under a minute.
 	keepaliveLaunchTimeout  = 5 * time.Minute
 	keepaliveCleanupTimeout = 30 * time.Second
 )
@@ -65,8 +61,7 @@ revokes it again. So this also launches and immediately terminates a throwaway
 instance from each at-risk AMI, recording activity for AWS's inactivity policy.
 An AMI counts as at-risk once it is deprecated, or close to it, and has not been
 launched in six months. AMIs with no reported last-launch time count as at-risk.
-Restoring and relaunching always act on the same AMIs, so --max-launches caps
-both: an AMI restored without a launch is one AWS makes private again.
+Restore and relaunch always act on the same AMIs, so --max-launches caps both.
 
 Note that AWS delays reporting a launch by up to 24 hours, so an AMI launched
 on one run may still look at-risk on the next one and get launched again.
@@ -110,9 +105,8 @@ func init() {
 		"Maximum AMIs to act on per run, most urgent first; 0 for no limit.")
 }
 
-// target is an at-risk AMI: one this run will launch a keepalive instance from.
-// needsPublic additionally means AWS has already taken its public sharing
-// permission away, so it needs restoring as well.
+// target is an at-risk AMI this run will launch a keepalive instance from.
+// needsPublic means AWS has already taken its public sharing permission away.
 type target struct {
 	id          string
 	name        string
@@ -133,18 +127,16 @@ func runEnsurePublic(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Restoring an AMI's public permission without also launching from it just
-	// gets the permission revoked again, so both halves have to act on the same
-	// AMIs. Order by urgency and apply the cap once, here, rather than letting
-	// each half pick its own set and drift apart.
+	// Restoring an AMI without launching from it just gets the permission
+	// revoked again, so both halves work from one ordered, capped list rather
+	// than each picking its own and drifting apart.
 	sortByUrgency(targets)
 	if !ensurePublicNoLaunch {
 		targets = capWorkList(targets)
 	}
 
-	// Work through every AMI before returning, so that one failure doesn't
-	// skip the rest. Errors go to stderr as we hit them, and are collected
-	// into the returned error so the command still exits non-zero.
+	// Work through every AMI before returning. Errors go to stderr as we hit
+	// them and are collected so the command still exits non-zero.
 	var errs []error
 	restoreFailures := 0
 
@@ -177,9 +169,8 @@ func runEnsurePublic(cmd *cobra.Command, args []string) error {
 	return errors.Join(errs...)
 }
 
-// ensurePublicTargets returns only the AMIs that need something done to them:
-// their public launch permission restored, a keepalive launch to reset AWS's
-// last-launched clock, or both. AMIs that are fine are not returned.
+// ensurePublicTargets returns the AMIs at risk of losing public access: those
+// needing their launch permission restored, a keepalive launch, or both.
 func ensurePublicTargets() ([]target, error) {
 	var images []ec2types.Image
 	if ensurePublicAMI != "" {
@@ -222,11 +213,9 @@ func ensurePublicTargets() ([]target, error) {
 		// already tells us what a per-AMI DescribeImageAttribute would.
 		t.needsPublic = img.Public == nil || !*img.Public
 
-		// AWS only revokes public access after an AMI's deprecation date, so an
-		// AMI that isn't near that date yet is not at risk. An AMI that has
-		// already lost public access is at risk either way: restoring it
-		// without a launch just gets it revoked again. And naming a single AMI
-		// with --ami means "do it".
+		// AWS only unshares after the deprecation date, so an AMI far from it
+		// is safe. One that already lost public access is at risk regardless:
+		// restoring it without a launch just gets it revoked. --ami means "do it".
 		stale := t.lastLaunch == nil || time.Since(*t.lastLaunch) >= keepaliveCutoff-keepaliveBuffer
 		atRisk := ensurePublicAMI != "" || t.needsPublic ||
 			(isDeprecating(t.deprecation) && stale)
@@ -236,10 +225,9 @@ func ensurePublicTargets() ([]target, error) {
 		}
 	}
 
-	// Every decision here rests on DescribeImages reporting LastLaunchedTime.
-	// If it silently stopped doing so, nothing would fail: every AMI would just
-	// look never-launched forever, and we'd relaunch the same capped batch
-	// every day without ever converging. Say so rather than letting it pass.
+	// If DescribeImages silently stopped reporting LastLaunchedTime, nothing
+	// would fail: every AMI would look never-launched and we'd relaunch the
+	// same capped batch daily without converging. Say so instead.
 	if len(images) > 1 && reportedLaunch == 0 {
 		fmt.Fprintf(os.Stderr,
 			"warning: none of the %d production AMIs in %s reports a last-launch time; "+
@@ -249,17 +237,17 @@ func ensurePublicTargets() ([]target, error) {
 	return targets, nil
 }
 
-// sortByUrgency orders AMIs most-urgent-first, so that a capped run spends its
-// budget on the ones closest to losing their public sharing property.
+// sortByUrgency orders AMIs most-urgent-first, so a capped run spends its
+// budget on the ones closest to losing public access.
 func sortByUrgency(targets []target) {
 	sort.SliceStable(targets, func(i, j int) bool {
 		a, b := targets[i], targets[j]
-		// Already unshared: broken for customers right now, and the restore
-		// this run performs on them is undone unless a launch goes with it.
+		// Already unshared: broken for customers now, and the restore this run
+		// performs is undone without the paired launch.
 		if a.needsPublic != b.needsPublic {
 			return a.needsPublic
 		}
-		// No launch AWS will admit to, so no clock left to run down.
+		// Never launched, so there's no clock left to run down.
 		if (a.lastLaunch == nil) != (b.lastLaunch == nil) {
 			return a.lastLaunch == nil
 		}
@@ -270,14 +258,13 @@ func sortByUrgency(targets []target) {
 	})
 }
 
-// capWorkList trims the run to --max-launches AMIs. It caps restores along with
-// launches: an AMI restored but not launched is one AWS unshares again, so
-// deferring half of the pair would just spend an API call to no effect.
+// capWorkList trims the run to --max-launches AMIs. Restores are capped along
+// with launches: restoring an AMI we won't launch only gets it unshared again.
 func capWorkList(targets []target) []target {
 	if ensurePublicMaxLaunches <= 0 || len(targets) <= ensurePublicMaxLaunches {
 		return targets
 	}
-	// Say plainly that the deferred AMIs aren't fixed yet: a bare count of what
+	// Spell out that the deferred AMIs aren't fixed yet; a bare count of what
 	// this run did reads like the whole backlog is handled.
 	fmt.Printf("%d AMIs at risk; acting on %d now, deferring %d to a later run "+
 		"(deferred AMIs stay at risk until then)\n",
@@ -286,11 +273,10 @@ func capWorkList(targets []target) []target {
 }
 
 // launchKeepaliveInstances launches, waits on, and terminates one throwaway
-// instance per AMI, so that AWS records a recent launch against it. Instances
-// are launched as a batch and waited on together: waiting out each boot in turn
-// would take far longer than a daily run can afford. The caller has already
-// ordered and capped the list. It returns an error summarizing every failure,
-// or nil if everything succeeded.
+// instance per AMI, so AWS records a recent launch against it. They go up as a
+// batch and are waited on together; serializing the boots would take far longer
+// than a daily run can afford. The caller has already ordered and capped the
+// list. Returns an error summarizing every failure, or nil if all succeeded.
 func launchKeepaliveInstances(targets []target) error {
 	if len(targets) == 0 {
 		return nil
@@ -298,14 +284,14 @@ func launchKeepaliveInstances(targets []target) error {
 
 	var errs []error
 
-	// launched maps each keepalive instance to the AMI it came from. Nothing
-	// here runs concurrently, so a plain map is enough: the interrupt handler
-	// only cancels a context, and cleanup happens on this goroutine.
+	// launched maps each keepalive instance to its AMI. Nothing here runs
+	// concurrently, so a plain map is enough: the interrupt handler only
+	// cancels a context, and cleanup happens on this goroutine.
 	launched := map[string]target{}
 	interruptCtx, stopInterrupts := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopInterrupts()
-	// Terminate on its own context rather than interruptCtx, so that a signal
-	// is what triggers cleanup instead of what prevents it.
+	// Its own context, not interruptCtx, so a signal triggers cleanup instead
+	// of preventing it.
 	cleanup := func() error {
 		if len(launched) == 0 {
 			return nil
@@ -318,8 +304,7 @@ func launchKeepaliveInstances(targets []target) error {
 		clear(launched)
 		return nil
 	}
-	// Keep a best-effort retry for panic and cleanup-failure paths. Normal
-	// cleanup below is explicit so its error affects the command exit status.
+	// Backstop for panics; the explicit call below sets the exit status.
 	defer func() {
 		if err := cleanup(); err != nil {
 			fmt.Fprintf(os.Stderr, "error terminating keepalive instances %v: %v\n", instanceIDs(launched), err)
@@ -327,9 +312,8 @@ func launchKeepaliveInstances(targets []target) error {
 	}()
 
 	for i, t := range targets {
-		// Checking once per iteration is enough: an interrupt arriving mid-launch
-		// is picked up before the next one starts, and anything already launched
-		// is recorded and gets terminated on the way out.
+		// Once per iteration is enough: an interrupt mid-launch is caught before
+		// the next one, and what's launched is recorded and cleaned up on exit.
 		if interruptCtx.Err() != nil {
 			fmt.Fprintln(os.Stderr, "interrupted; stopping keepalive launches and cleaning up")
 			break
@@ -343,11 +327,10 @@ func launchKeepaliveInstances(targets []target) error {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error launching keepalive for %s (%s): %v\n", t.id, t.name, err)
 			errs = append(errs, fmt.Errorf("launching keepalive for %s: %v", t.id, err))
-			// Some failures are properties of the region rather than of one
-			// AMI — no instance quota left, no default VPC to launch into — and
-			// every remaining AMI would fail the same way. Stop rather than
-			// turning one problem into a page of identical errors. The AMIs we
-			// skip are picked up by a later run, once someone has fixed it.
+			// Properties of the region, not of one AMI — no quota left, no
+			// default VPC — so every remaining AMI fails identically. Stop
+			// instead of printing a page of the same error; a later run
+			// picks them up once someone has fixed it.
 			if errors.Is(err, aws.ErrInstanceQuotaExceeded) || errors.Is(err, aws.ErrNoDefaultVPC) {
 				fmt.Fprintf(os.Stderr, "skipping the remaining %d AMI(s) in %s\n",
 					len(targets)-i-1, region)
@@ -361,20 +344,18 @@ func launchKeepaliveInstances(targets []target) error {
 	}
 
 	if ids := instanceIDs(launched); len(ids) > 0 {
-		// Wait for the instances to reach running before tearing them down. The
-		// launch is already recorded against the AMI by this point; what the
-		// wait buys is noticing an AMI that EC2 accepts but can't actually boot,
-		// which would otherwise go unreported. Reaching running does not prove
-		// the guest OS is healthy.
+		// Wait for running before tearing them down. The launch is already
+		// recorded by this point; the wait catches an AMI that EC2 accepts but
+		// can't boot. Running does not prove the guest OS is healthy.
 		if interruptCtx.Err() == nil {
 			failures, err := API.WaitForInstancesRunning(interruptCtx, ids, keepaliveLaunchTimeout)
 			if err != nil {
-				// We couldn't read the states at all, so we know nothing about
-				// any individual instance. Report that once, not once per ID.
+				// No states read at all, so nothing is known per-instance.
+				// Report that once, not once per ID.
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 				errs = append(errs, err)
 			}
-			// Walk ids rather than the map so the order is stable from run to run.
+			// Walk ids, not the map, so the order is stable run to run.
 			for _, id := range ids {
 				failure, ok := failures[id]
 				if !ok {
@@ -393,8 +374,7 @@ func launchKeepaliveInstances(targets []target) error {
 		}
 	}
 
-	// Reported once at the end, whether the signal arrived during the launch
-	// loop or the wait above.
+	// Reported once, whether the signal arrived during the loop or the wait.
 	if interruptCtx.Err() != nil {
 		errs = append(errs, errors.New("interrupted before every at-risk AMI was relaunched"))
 	}
@@ -412,16 +392,14 @@ func instanceIDs(launched map[string]target) []string {
 	return ids
 }
 
-// isDeprecating reports whether an AMI is past its deprecation date or will be
-// within keepaliveBuffer.
+// isDeprecating reports whether an AMI deprecates within keepaliveBuffer, or has.
 func isDeprecating(deprecation string) bool {
 	t := parseAWSTime(deprecation)
 	return t != nil && t.Before(time.Now().Add(keepaliveBuffer))
 }
 
-// parseAWSTime parses an EC2 API timestamp, returning nil if it's absent or
-// unparseable. Go accepts a fractional second even though RFC3339 doesn't
-// spell one out, so this handles both of the forms EC2 uses.
+// parseAWSTime parses an EC2 timestamp, returning nil if absent or unparseable.
+// Go accepts the fractional second EC2 sometimes adds, so one layout covers both.
 func parseAWSTime(s string) *time.Time {
 	t, err := time.Parse(time.RFC3339, s)
 	if err != nil {
