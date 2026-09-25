@@ -38,13 +38,14 @@ func (a *API) getSecurityGroupID(name string) (string, error) {
 			},
 		},
 	})
-
-	if len(sgIds.SecurityGroups) == 0 {
-		return a.createSecurityGroup(name)
-	}
-
 	if err != nil {
 		return "", fmt.Errorf("unable to get security group named %v: %v", name, err)
+	}
+	if sgIds == nil {
+		return "", fmt.Errorf("unable to get security group named %v: empty response", name)
+	}
+	if len(sgIds.SecurityGroups) == 0 {
+		return a.createSecurityGroup(name)
 	}
 
 	return *sgIds.SecurityGroups[0].GroupId, nil
@@ -382,4 +383,43 @@ func (a *API) getVPCID(sgId string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no vpc found for security group %v", sgId)
+}
+
+// keepaliveNetwork resolves a security group and a subnet that can host the
+// given instance type, for LaunchKeepaliveInstance to fall back on in a region
+// with no default VPC. getSecurityGroupID creates the security group, and with
+// it a whole VPC, if it doesn't exist yet, so it and everything under it are
+// named after KeepalivePurpose rather than sharing kola's names: this is a
+// distinct, disposable piece of infrastructure and should read as one.
+func (a *API) keepaliveNetwork(instanceType string) (string, string, error) {
+	sgID, err := a.getSecurityGroupID(KeepalivePurpose)
+	if err != nil {
+		return "", "", fmt.Errorf("resolving security group: %v", err)
+	}
+	vpcID, err := a.getVPCID(sgID)
+	if err != nil {
+		return "", "", fmt.Errorf("resolving vpc: %v", err)
+	}
+	zones, err := a.GetZonesForInstanceType(instanceType)
+	if err != nil {
+		return "", "", err
+	}
+	for _, zone := range zones {
+		subnetID, err := a.getSubnetID(vpcID, zone)
+		if err == nil {
+			return sgID, subnetID, nil
+		}
+		plog.Debugf("no subnet for %v in %v: %v", vpcID, zone, err)
+	}
+	return "", "", fmt.Errorf("no subnet of %v is in a zone offering %v", vpcID, instanceType)
+}
+
+// isNoDefaultVPCError reports whether RunInstances failed because no subnet was
+// given and the region has no default VPC to fall back on.
+func isNoDefaultVPCError(err error) bool {
+	var ae smithy.APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	return ae.ErrorCode() == "VPCIdNotSpecified" || ae.ErrorCode() == "DefaultVpcDoesNotExist"
 }

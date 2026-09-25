@@ -27,6 +27,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/smithy-go"
+	"github.com/google/uuid"
 
 	"github.com/coreos/coreos-assembler/mantle/util"
 )
@@ -315,6 +316,11 @@ func (a *API) gcEC2(gracePeriod time.Duration) error {
 
 // TerminateInstances schedules EC2 instances to be terminated.
 func (a *API) TerminateInstances(ids []string) error {
+	return a.TerminateInstancesWithContext(context.Background(), ids)
+}
+
+// TerminateInstancesWithContext schedules EC2 instances to be terminated.
+func (a *API) TerminateInstancesWithContext(ctx context.Context, ids []string) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -322,7 +328,7 @@ func (a *API) TerminateInstances(ids []string) error {
 		InstanceIds: ids,
 	}
 
-	if _, err := a.ec2.TerminateInstances(context.Background(), input); err != nil {
+	if _, err := a.ec2.TerminateInstances(ctx, input); err != nil {
 		return err
 	}
 
@@ -400,4 +406,235 @@ func (a *API) GetZonesForInstanceType(instanceType string) ([]string, error) {
 		zones = append(zones, *v.Location)
 	}
 	return zones, nil
+}
+
+// KeepalivePurpose is the value of the Purpose tag on throwaway instances
+// launched to keep an AMI active. Together with CreatedBy=mantle, it scopes
+// cleanup to these instances rather than every instance created by mantle.
+const KeepalivePurpose = "ami-keepalive"
+
+// keepaliveRunTimeout bounds a single RunInstances attempt, including the
+// idempotent retries of an ambiguous failure. RunInstances normally answers in
+// a few seconds; this is here so a hung call can't stall a run that has to get
+// through every at-risk AMI in a region.
+const keepaliveRunTimeout = 30 * time.Second
+
+// keepaliveInstanceTypes lists, per architecture, the instance types to try for
+// a keepalive launch, cheapest first. They're all Nitro so that they can boot
+// UEFI images; aarch64 CoreOS AMIs are always registered with a UEFI boot mode
+// (see CreateHVMImage).
+//
+// The burstable types come first because they're broadly available and cheap.
+// The second entry is from a different family and is tried if the first is not
+// offered or has no capacity.
+var keepaliveInstanceTypes = map[ec2types.ArchitectureValues][]string{
+	ec2types.ArchitectureValuesX8664: {"t3.micro", "m6i.large"},
+	ec2types.ArchitectureValuesArm64: {"t4g.micro", "m6g.medium"},
+}
+
+// KeepaliveInstanceType returns the instance type a keepalive launch will try
+// first for the given architecture. It makes no API call, so it can't account
+// for what the region actually offers; LaunchKeepaliveInstance falls through to
+// the next candidate if this one is rejected. Only useful for reporting.
+func KeepaliveInstanceType(arch ec2types.ArchitectureValues) (string, error) {
+	types := keepaliveInstanceTypes[arch]
+	if len(types) == 0 {
+		return "", fmt.Errorf("no keepalive instance types known for architecture %q", string(arch))
+	}
+	return types[0], nil
+}
+
+// LaunchKeepaliveInstance launches a single throwaway instance from the given
+// AMI, purely so that AWS records a launch against it, and returns the instance
+// ID along with the instance type that worked. The caller is responsible for
+// terminating the instance.
+//
+// Unlike CreateInstances, this attaches no key pair and no user data, and
+// doesn't wait for the instance to become reachable, because nothing ever logs
+// into it. It launches into the default VPC, falling back to the fixed
+// ami-keepalive network when the region has no default VPC.
+func (a *API) LaunchKeepaliveInstance(imageID string, arch ec2types.ArchitectureValues) (string, string, error) {
+	types := keepaliveInstanceTypes[arch]
+	if len(types) == 0 {
+		return "", "", fmt.Errorf("no keepalive instance types known for architecture %q", string(arch))
+	}
+
+	var attempts []string
+	for _, instanceType := range types {
+		clientToken := uuid.NewString()
+		input := keepaliveRunInstancesInput(imageID, instanceType, clientToken)
+		ctx, cancel := context.WithTimeout(context.Background(), keepaliveRunTimeout)
+		res, err := runInstancesIdempotently(ctx, &input, a.ec2.RunInstances)
+		cancel()
+		if err != nil && isNoDefaultVPCError(err) {
+			plog.Debugf("no default VPC in %v, resolving the keepalive network", a.opts.Region)
+			sgID, subnetID, fallbackErr := a.keepaliveNetwork(instanceType)
+			if fallbackErr != nil {
+				attempts = append(attempts, fmt.Sprintf("%v: %v (and no fallback network: %v)", instanceType, err, fallbackErr))
+				continue
+			}
+			input = keepaliveRunInstancesInput(imageID, instanceType, uuid.NewString())
+			input.SecurityGroupIds = []string{sgID}
+			input.SubnetId = aws.String(subnetID)
+			ctx, cancel = context.WithTimeout(context.Background(), keepaliveRunTimeout)
+			res, err = runInstancesIdempotently(ctx, &input, a.ec2.RunInstances)
+			cancel()
+		}
+		if err == nil {
+			if res == nil || len(res.Instances) == 0 || res.Instances[0].InstanceId == nil {
+				return "", "", fmt.Errorf("launching keepalive instance from %v: no instance returned", imageID)
+			}
+			return *res.Instances[0].InstanceId, instanceType, nil
+		}
+		attempts = append(attempts, fmt.Sprintf("%v: %v", instanceType, err))
+		if !isUnusableInstanceTypeError(err) {
+			break
+		}
+		plog.Debugf("keepalive instance type %v unusable in %v: %v", instanceType, a.opts.Region, err)
+	}
+	return "", "", fmt.Errorf("launching keepalive instance from %v: %v", imageID, strings.Join(attempts, "; "))
+}
+
+func keepaliveRunInstancesInput(imageID, instanceType, clientToken string) ec2.RunInstancesInput {
+	tags := []ec2types.Tag{
+		{Key: aws.String("Name"), Value: aws.String(KeepalivePurpose + "-" + imageID)},
+		{Key: aws.String("CreatedBy"), Value: aws.String("mantle")},
+		{Key: aws.String("Purpose"), Value: aws.String(KeepalivePurpose)},
+	}
+	input := ec2.RunInstancesInput{
+		ImageId:      aws.String(imageID),
+		InstanceType: ec2types.InstanceType(instanceType),
+		MinCount:     aws.Int32(1),
+		MaxCount:     aws.Int32(1),
+		ClientToken:  aws.String(clientToken),
+		TagSpecifications: []ec2types.TagSpecification{
+			{ResourceType: ec2types.ResourceTypeInstance, Tags: tags},
+			{ResourceType: ec2types.ResourceTypeVolume, Tags: tags},
+		},
+	}
+	return input
+}
+
+type runInstancesFunc func(context.Context, *ec2.RunInstancesInput, ...func(*ec2.Options)) (*ec2.RunInstancesOutput, error)
+
+// runInstancesIdempotently retries ambiguous failures with the exact same
+// request and client token. EC2 then returns the original launch instead of
+// creating a duplicate if the first request actually succeeded.
+func runInstancesIdempotently(ctx context.Context, input *ec2.RunInstancesInput, run runInstancesFunc) (*ec2.RunInstancesOutput, error) {
+	var lastErr error
+	attempt := 0
+	for {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("RunInstances remained ambiguous after %d attempts: %v: %w", attempt, lastErr, ctx.Err())
+		}
+		output, err := run(ctx, input)
+		attempt++
+		if err == nil || !isAmbiguousRunInstancesError(err) {
+			return output, err
+		}
+		lastErr = err
+		// The first explicit retry is immediate; the SDK already exhausted
+		// its own backoff before returning the ambiguous error. Pace any
+		// subsequent retries to avoid a tight loop during a network outage.
+		if attempt > 1 {
+			timer := time.NewTimer(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+			case <-timer.C:
+			}
+		}
+	}
+}
+
+// isUnusableInstanceTypeError reports whether RunInstances failed in a way that
+// a different instance type might fix: the type isn't offered here, isn't valid
+// for the AMI, or has no capacity right now.
+func isUnusableInstanceTypeError(err error) bool {
+	var ae smithy.APIError
+	if !errors.As(err, &ae) {
+		return false
+	}
+	switch ae.ErrorCode() {
+	case "Unsupported", "UnsupportedOperation", "InvalidInstanceType", "InsufficientInstanceCapacity":
+		return true
+	}
+	return false
+}
+
+func isAmbiguousRunInstancesError(err error) bool {
+	var ae smithy.APIError
+	if !errors.As(err, &ae) {
+		return true
+	}
+	return ae.ErrorFault() == smithy.FaultServer
+}
+
+// WaitForInstancesLeavePending polls until every given instance has left the
+// "pending" state, and reports the outcome per instance ID: a nil value means
+// the instance reached "running", a non-nil value means it failed to start.
+// The returned error is non-nil only when we couldn't determine the states at
+// all, in which case the partial results so far are still returned.
+func (a *API) WaitForInstancesLeavePending(ctx context.Context, ids []string, timeout time.Duration) (map[string]error, error) {
+	results := make(map[string]error, len(ids))
+	if len(ids) == 0 {
+		return results, nil
+	}
+
+	// don't make api calls too quickly, or we will hit the rate limit
+	delay := 10 * time.Second
+	err := util.WaitUntilReady(timeout, delay, func() (bool, error) {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		desc, err := a.ec2.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+			InstanceIds: ids,
+		})
+		if err != nil {
+			// Keep retrying if the InstanceID disappears momentarily
+			var ae smithy.APIError
+			if errors.As(err, &ae) && ae.ErrorCode() == "InvalidInstanceID.NotFound" {
+				plog.Debugf("instance ID not found, retrying: %v", err)
+				return false, nil
+			}
+			return false, err
+		}
+
+		updateKeepaliveResults(results, desc)
+		return len(results) == len(ids), nil
+	})
+	if err != nil {
+		return results, fmt.Errorf("waiting for instances to leave pending: %v", err)
+	}
+	return results, nil
+}
+
+func updateKeepaliveResults(results map[string]error, desc *ec2.DescribeInstancesOutput) {
+	for _, reservation := range desc.Reservations {
+		for _, inst := range reservation.Instances {
+			if inst.InstanceId == nil || inst.State == nil {
+				continue
+			}
+			id := *inst.InstanceId
+			if _, settled := results[id]; settled {
+				continue
+			}
+			switch inst.State.Name {
+			case ec2types.InstanceStateNamePending:
+				// still starting up
+			case ec2types.InstanceStateNameRunning:
+				results[id] = nil
+			default:
+				results[id] = fmt.Errorf("instance entered state %q: %s",
+					string(inst.State.Name), instanceStateReason(inst))
+			}
+		}
+	}
+}
+
+func instanceStateReason(inst ec2types.Instance) string {
+	if inst.StateReason != nil && inst.StateReason.Message != nil {
+		return *inst.StateReason.Message
+	}
+	return "no reason given"
 }
