@@ -16,7 +16,6 @@ package aws
 
 import (
 	"context"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -67,11 +66,6 @@ type API struct {
 	sts      *sts.Client
 	opts     *Options
 	tManager *transfermanager.Client
-
-	// keepaliveNets caches the network keepalive launches fall back on in a
-	// region with no default VPC, keyed by instance type. See keepaliveNetwork.
-	keepaliveNetMu sync.Mutex
-	keepaliveNets  map[string]keepaliveNet
 }
 
 // New creates a new AWS API wrapper. It uses credentials from any of the

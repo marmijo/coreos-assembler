@@ -65,6 +65,8 @@ revokes it again. So this also launches and immediately terminates a throwaway
 instance from each at-risk AMI, recording activity for AWS's inactivity policy.
 An AMI counts as at-risk once it is deprecated, or close to it, and has not been
 launched in six months. AMIs with no reported last-launch time count as at-risk.
+Restoring and relaunching always act on the same AMIs, so --max-launches caps
+both: an AMI restored without a launch is one AWS makes private again.
 
 Note that AWS delays reporting a launch by up to 24 hours, so an AMI launched
 on one run may still look at-risk on the next one and get launched again.
@@ -105,10 +107,12 @@ func init() {
 	cmdEnsurePublic.Flags().BoolVar(&ensurePublicNoLaunch, "no-launch", false,
 		"Only restore public permissions; don't launch keepalive instances.")
 	cmdEnsurePublic.Flags().IntVar(&ensurePublicMaxLaunches, "max-launches", 25,
-		"Maximum keepalive instances to launch per run; 0 for no limit.")
+		"Maximum AMIs to act on per run, most urgent first; 0 for no limit.")
 }
 
-// target is an AMI we've decided to act on, and what needs doing to it.
+// target is an at-risk AMI: one this run will launch a keepalive instance from.
+// needsPublic additionally means AWS has already taken its public sharing
+// permission away, so it needs restoring as well.
 type target struct {
 	id          string
 	name        string
@@ -117,7 +121,6 @@ type target struct {
 	// lastLaunch is nil when the AMI has never been launched.
 	lastLaunch  *time.Time
 	needsPublic bool
-	needsLaunch bool
 }
 
 func runEnsurePublic(cmd *cobra.Command, args []string) error {
@@ -128,6 +131,15 @@ func runEnsurePublic(cmd *cobra.Command, args []string) error {
 	targets, err := ensurePublicTargets()
 	if err != nil {
 		return err
+	}
+
+	// Restoring an AMI's public permission without also launching from it just
+	// gets the permission revoked again, so both halves have to act on the same
+	// AMIs. Order by urgency and apply the cap once, here, rather than letting
+	// each half pick its own set and drift apart.
+	sortByUrgency(targets)
+	if !ensurePublicNoLaunch {
+		targets = capWorkList(targets)
 	}
 
 	// Work through every AMI before returning, so that one failure doesn't
@@ -212,14 +224,14 @@ func ensurePublicTargets() ([]target, error) {
 
 		// AWS only revokes public access after an AMI's deprecation date, so an
 		// AMI that isn't near that date yet is not at risk. An AMI that has
-		// already lost public access needs a launch either way: restoring it
-		// without one just gets it revoked again. And naming a single AMI with
-		// --ami means "do it".
+		// already lost public access is at risk either way: restoring it
+		// without a launch just gets it revoked again. And naming a single AMI
+		// with --ami means "do it".
 		stale := t.lastLaunch == nil || time.Since(*t.lastLaunch) >= keepaliveCutoff-keepaliveBuffer
-		t.needsLaunch = ensurePublicAMI != "" || t.needsPublic ||
+		atRisk := ensurePublicAMI != "" || t.needsPublic ||
 			(isDeprecating(t.deprecation) && stale)
 
-		if t.needsPublic || t.needsLaunch {
+		if atRisk {
 			targets = append(targets, t)
 		}
 	}
@@ -237,39 +249,51 @@ func ensurePublicTargets() ([]target, error) {
 	return targets, nil
 }
 
-// launchKeepaliveInstances launches, waits on, and terminates one throwaway instance
-// per at-risk AMI, so that AWS records a recent launch against it. Instances
-// are launched as a batch and waited on together: waiting out each boot in turn
-// would take far longer than a daily run can afford. It returns an error
-// summarizing every failure, or nil if everything succeeded.
-func launchKeepaliveInstances(targets []target) error {
-	atRisk := make([]target, 0, len(targets))
-	for _, t := range targets {
-		if t.needsLaunch {
-			atRisk = append(atRisk, t)
+// sortByUrgency orders AMIs most-urgent-first, so that a capped run spends its
+// budget on the ones closest to losing their public sharing property.
+func sortByUrgency(targets []target) {
+	sort.SliceStable(targets, func(i, j int) bool {
+		a, b := targets[i], targets[j]
+		// Already unshared: broken for customers right now, and the restore
+		// this run performs on them is undone unless a launch goes with it.
+		if a.needsPublic != b.needsPublic {
+			return a.needsPublic
 		}
-	}
-	if len(atRisk) == 0 {
-		return nil
-	}
-
-	// Most urgent first, so that a capped run works on the AMIs closest to
-	// losing their public sharing property. Never-launched AMIs sort first.
-	sort.SliceStable(atRisk, func(i, j int) bool {
-		a, b := atRisk[i].lastLaunch, atRisk[j].lastLaunch
-		if a == nil || b == nil {
-			return a == nil && b != nil
+		// No launch AWS will admit to, so no clock left to run down.
+		if (a.lastLaunch == nil) != (b.lastLaunch == nil) {
+			return a.lastLaunch == nil
 		}
-		return a.Before(*b)
+		if a.lastLaunch == nil {
+			return false
+		}
+		return a.lastLaunch.Before(*b.lastLaunch)
 	})
-	if ensurePublicMaxLaunches > 0 && len(atRisk) > ensurePublicMaxLaunches {
-		// Restoring public access without a launch only buys until AWS's next
-		// sweep, so say plainly that the deferred AMIs aren't fixed yet: "N
-		// restored" on its own reads like the problem is solved.
-		fmt.Printf("%d AMIs at risk; launching %d now, deferring %d to a later run "+
-			"(deferred AMIs may lose public access again before then)\n",
-			len(atRisk), ensurePublicMaxLaunches, len(atRisk)-ensurePublicMaxLaunches)
-		atRisk = atRisk[:ensurePublicMaxLaunches]
+}
+
+// capWorkList trims the run to --max-launches AMIs. It caps restores along with
+// launches: an AMI restored but not launched is one AWS unshares again, so
+// deferring half of the pair would just spend an API call to no effect.
+func capWorkList(targets []target) []target {
+	if ensurePublicMaxLaunches <= 0 || len(targets) <= ensurePublicMaxLaunches {
+		return targets
+	}
+	// Say plainly that the deferred AMIs aren't fixed yet: a bare count of what
+	// this run did reads like the whole backlog is handled.
+	fmt.Printf("%d AMIs at risk; acting on %d now, deferring %d to a later run "+
+		"(deferred AMIs stay at risk until then)\n",
+		len(targets), ensurePublicMaxLaunches, len(targets)-ensurePublicMaxLaunches)
+	return targets[:ensurePublicMaxLaunches]
+}
+
+// launchKeepaliveInstances launches, waits on, and terminates one throwaway
+// instance per AMI, so that AWS records a recent launch against it. Instances
+// are launched as a batch and waited on together: waiting out each boot in turn
+// would take far longer than a daily run can afford. The caller has already
+// ordered and capped the list. It returns an error summarizing every failure,
+// or nil if everything succeeded.
+func launchKeepaliveInstances(targets []target) error {
+	if len(targets) == 0 {
+		return nil
 	}
 
 	var errs []error
@@ -302,7 +326,7 @@ func launchKeepaliveInstances(targets []target) error {
 		}
 	}()
 
-	for i, t := range atRisk {
+	for i, t := range targets {
 		// Checking once per iteration is enough: an interrupt arriving mid-launch
 		// is picked up before the next one starts, and anything already launched
 		// is recorded and gets terminated on the way out.
@@ -319,13 +343,14 @@ func launchKeepaliveInstances(targets []target) error {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error launching keepalive for %s (%s): %v\n", t.id, t.name, err)
 			errs = append(errs, fmt.Errorf("launching keepalive for %s: %v", t.id, err))
-			// Out of instance quota: every remaining AMI would fail the same
-			// way, so stop rather than turning one problem into a page of
-			// identical errors. The AMIs we skip are picked up by a later run,
-			// once someone has raised the quota.
-			if errors.Is(err, aws.ErrInstanceQuotaExceeded) {
-				fmt.Fprintf(os.Stderr, "out of instance quota in %s; skipping the remaining %d AMI(s)\n",
-					region, len(atRisk)-i-1)
+			// Some failures are properties of the region rather than of one
+			// AMI — no instance quota left, no default VPC to launch into — and
+			// every remaining AMI would fail the same way. Stop rather than
+			// turning one problem into a page of identical errors. The AMIs we
+			// skip are picked up by a later run, once someone has fixed it.
+			if errors.Is(err, aws.ErrInstanceQuotaExceeded) || errors.Is(err, aws.ErrNoDefaultVPC) {
+				fmt.Fprintf(os.Stderr, "skipping the remaining %d AMI(s) in %s\n",
+					len(targets)-i-1, region)
 				break
 			}
 			continue
