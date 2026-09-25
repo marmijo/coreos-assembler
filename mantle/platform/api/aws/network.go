@@ -391,7 +391,33 @@ func (a *API) getVPCID(sgId string) (string, error) {
 // it a whole VPC, if it doesn't exist yet, so it and everything under it are
 // named after KeepalivePurpose rather than sharing kola's names: this is a
 // distinct, disposable piece of infrastructure and should read as one.
+//
+// The result is cached per instance type: a run that relaunches every at-risk
+// AMI in a region resolves the same network over and over otherwise, and each
+// resolution is four API calls.
 func (a *API) keepaliveNetwork(instanceType string) (string, string, error) {
+	a.keepaliveNetMu.Lock()
+	defer a.keepaliveNetMu.Unlock()
+	if net, ok := a.keepaliveNets[instanceType]; ok {
+		return net.securityGroupID, net.subnetID, nil
+	}
+	sgID, subnetID, err := a.resolveKeepaliveNetwork(instanceType)
+	if err != nil {
+		return "", "", err
+	}
+	if a.keepaliveNets == nil {
+		a.keepaliveNets = map[string]keepaliveNet{}
+	}
+	a.keepaliveNets[instanceType] = keepaliveNet{securityGroupID: sgID, subnetID: subnetID}
+	return sgID, subnetID, nil
+}
+
+type keepaliveNet struct {
+	securityGroupID string
+	subnetID        string
+}
+
+func (a *API) resolveKeepaliveNetwork(instanceType string) (string, string, error) {
 	sgID, err := a.getSecurityGroupID(KeepalivePurpose)
 	if err != nil {
 		return "", "", fmt.Errorf("resolving security group: %v", err)
