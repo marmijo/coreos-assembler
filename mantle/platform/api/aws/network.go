@@ -384,3 +384,56 @@ func (a *API) getVPCID(sgId string) (string, error) {
 	}
 	return "", fmt.Errorf("no vpc found for security group %v", sgId)
 }
+
+// keepaliveNetwork resolves a security group and a subnet that can host the
+// given instance type, for LaunchKeepaliveInstance to fall back on in a region
+// with no default VPC. getSecurityGroupID creates the group, and with it a
+// whole VPC, if it's missing, so everything is named after KeepalivePurpose
+// rather than sharing kola's names: this is distinct, disposable infrastructure.
+//
+// Cached per instance type: resolution is four API calls, and a run relaunching
+// every at-risk AMI in a region would otherwise repeat it for each one.
+func (a *API) keepaliveNetwork(instanceType string) (string, string, error) {
+	a.keepaliveNetMu.Lock()
+	defer a.keepaliveNetMu.Unlock()
+	if net, ok := a.keepaliveNets[instanceType]; ok {
+		return net.securityGroupID, net.subnetID, nil
+	}
+	sgID, subnetID, err := a.resolveKeepaliveNetwork(instanceType)
+	if err != nil {
+		return "", "", err
+	}
+	if a.keepaliveNets == nil {
+		a.keepaliveNets = map[string]keepaliveNet{}
+	}
+	a.keepaliveNets[instanceType] = keepaliveNet{securityGroupID: sgID, subnetID: subnetID}
+	return sgID, subnetID, nil
+}
+
+type keepaliveNet struct {
+	securityGroupID string
+	subnetID        string
+}
+
+func (a *API) resolveKeepaliveNetwork(instanceType string) (string, string, error) {
+	sgID, err := a.getSecurityGroupID(KeepalivePurpose)
+	if err != nil {
+		return "", "", fmt.Errorf("resolving security group: %v", err)
+	}
+	vpcID, err := a.getVPCID(sgID)
+	if err != nil {
+		return "", "", fmt.Errorf("resolving vpc: %v", err)
+	}
+	zones, err := a.GetZonesForInstanceType(instanceType)
+	if err != nil {
+		return "", "", err
+	}
+	for _, zone := range zones {
+		subnetID, err := a.getSubnetID(vpcID, zone)
+		if err == nil {
+			return sgID, subnetID, nil
+		}
+		plog.Debugf("no subnet for %v in %v: %v", vpcID, zone, err)
+	}
+	return "", "", fmt.Errorf("no subnet of %v is in a zone offering %v", vpcID, instanceType)
+}

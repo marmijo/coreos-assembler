@@ -409,8 +409,9 @@ func (a *API) GetZonesForInstanceType(instanceType string) ([]string, error) {
 }
 
 // KeepalivePurpose is the value of the Purpose tag on throwaway instances
-// launched to keep an AMI active, telling them apart from kola's in the
-// console. gcEC2 collects both, matching the CreatedBy=mantle tag these carry.
+// launched to keep an AMI active, and the name of the network they fall back on
+// where there's no default VPC. It tells them apart from kola's in the console;
+// gcEC2 collects both, matching the CreatedBy=mantle tag these also carry.
 const KeepalivePurpose = "ami-keepalive"
 
 // keepaliveRunTimeout bounds one RunInstances attempt, SDK retries included, so
@@ -423,13 +424,14 @@ const keepaliveRunTimeout = 30 * time.Second
 // callers should stop rather than work through the rest of their list.
 var ErrInstanceQuotaExceeded = errors.New("on-demand instance quota exceeded")
 
-// ErrNoDefaultVPC reports that the region has no default VPC to launch into.
-// Like a quota failure this is a property of the region, not of one AMI, so
-// callers should stop rather than work through the rest of their list.
+// ErrNoDefaultVPC reports that the region has no default VPC and that the
+// ami-keepalive network couldn't be built either. Like a quota failure this is
+// a property of the region, not of one AMI, so callers should stop rather than
+// work through the rest of their list.
 //
-// AWS creates a default VPC when an account enables a region, so this should
-// not happen. If it does — a newly onboarded region, or one where someone
-// deleted the default VPC by hand — recreate it with:
+// AWS creates a default VPC when an account enables a region, so reaching this
+// means both that the region lacks one and that we can't make our own network —
+// usually missing permissions or a VPC quota. Restore the default VPC with:
 //
 //	aws ec2 create-default-vpc --region <region>
 var ErrNoDefaultVPC = errors.New("region has no default VPC")
@@ -449,8 +451,8 @@ var keepaliveInstanceTypes = map[ec2types.ArchitectureValues][]string{
 // the instance type that worked. The caller must terminate the instance.
 //
 // Unlike CreateInstances it attaches no key pair and no user data, and doesn't
-// wait for reachability, because nothing ever logs in. It uses the region's
-// default VPC, so it needs no network of its own and leaves nothing behind.
+// wait for reachability, because nothing ever logs in. It launches into the
+// default VPC, falling back to the ami-keepalive network where there isn't one.
 //
 // A failure that would defeat any further launch in this region is returned
 // wrapping ErrInstanceQuotaExceeded or ErrNoDefaultVPC.
@@ -461,8 +463,22 @@ func (a *API) LaunchKeepaliveInstance(imageID string, arch ec2types.Architecture
 	}
 
 	var attempts []string
+	networkFailures := 0
 	for _, instanceType := range types {
 		res, err := a.runKeepaliveInstance(imageID, instanceType)
+		if err != nil && isNoDefaultVPCError(err) {
+			plog.Debugf("no default VPC in %v, resolving the keepalive network", a.opts.Region)
+			sgID, subnetID, netErr := a.keepaliveNetwork(instanceType)
+			if netErr != nil {
+				networkFailures++
+				attempts = append(attempts, fmt.Sprintf("%v: %v (no keepalive network: %v)", instanceType, err, netErr))
+				continue
+			}
+			res, err = a.runKeepaliveInstance(imageID, instanceType, func(in *ec2.RunInstancesInput) {
+				in.SecurityGroupIds = []string{sgID}
+				in.SubnetId = aws.String(subnetID)
+			})
+		}
 		if err == nil {
 			if res == nil || len(res.Instances) == 0 || res.Instances[0].InstanceId == nil {
 				return "", "", fmt.Errorf("launching keepalive instance from %v: no instance returned", imageID)
@@ -470,13 +486,6 @@ func (a *API) LaunchKeepaliveInstance(imageID string, arch ec2types.Architecture
 			return *res.Instances[0].InstanceId, instanceType, nil
 		}
 		attempts = append(attempts, fmt.Sprintf("%v: %v", instanceType, err))
-		if isNoDefaultVPCError(err) {
-			// Not the instance type's doing, and no later run fixes it by
-			// itself: someone has to create the default VPC.
-			return "", "", fmt.Errorf("launching keepalive instance from %v: %w; "+
-				"create one with \"aws ec2 create-default-vpc --region %v\": %v",
-				imageID, ErrNoDefaultVPC, a.opts.Region, strings.Join(attempts, "; "))
-		}
 		if isInstanceQuotaError(err) {
 			// Another type wouldn't help: the quota counts vCPUs across the
 			// family, and the fallback types are no smaller.
@@ -488,14 +497,24 @@ func (a *API) LaunchKeepaliveInstance(imageID string, arch ec2types.Architecture
 		}
 		plog.Debugf("keepalive instance type %v unusable in %v: %v", instanceType, a.opts.Region, err)
 	}
+	if networkFailures == len(types) {
+		// No default VPC, and no fallback network for any instance type. The
+		// next AMI would hit the same wall, so let the caller stop early.
+		return "", "", fmt.Errorf("launching keepalive instance from %v: %w; create one with "+
+			"\"aws ec2 create-default-vpc --region %v\": %v",
+			imageID, ErrNoDefaultVPC, a.opts.Region, strings.Join(attempts, "; "))
+	}
 	return "", "", fmt.Errorf("launching keepalive instance from %v: %v", imageID, strings.Join(attempts, "; "))
 }
 
 // runKeepaliveInstance makes one bounded RunInstances call. The client token
 // makes it idempotent, so an SDK retry of a lost response returns the original
 // launch rather than creating a second instance.
-func (a *API) runKeepaliveInstance(imageID, instanceType string) (*ec2.RunInstancesOutput, error) {
+func (a *API) runKeepaliveInstance(imageID, instanceType string, opts ...func(*ec2.RunInstancesInput)) (*ec2.RunInstancesOutput, error) {
 	input := keepaliveRunInstancesInput(imageID, instanceType, uuid.NewString())
+	for _, opt := range opts {
+		opt(&input)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), keepaliveRunTimeout)
 	defer cancel()
 	return a.ec2.RunInstances(ctx, &input)
